@@ -1,0 +1,371 @@
+#!/usr/bin/env bash
+
+set -e
+set -u
+set -o pipefail
+
+
+# --------------------------------------------------------------------------------------------------
+# GLOBALS
+# --------------------------------------------------------------------------------------------------
+APP_NAME="header-fuzz"
+APP_VERSION="0.1.0"
+
+DEF_HEADER="Host"
+DEF_IGNORE_CODES="403"
+DEF_FUZZ="%FUZZ%"
+
+# --------------------------------------------------------------------------------------------------
+# PRINT FUNCTIONS
+# --------------------------------------------------------------------------------------------------
+
+print_version() {
+	echo "${APP_NAME} v${APP_VERSION} by cytopia"
+}
+
+print_help() {
+	echo "Usage: ${APP_NAME} [-H <header>] [-i <code>] [-p <proxy>] [-f <FUZZ>] -w </path/wordlist> -u <url>"
+	echo "       ${APP_NAME} -h"
+	echo "       ${APP_NAME} -v"
+	echo
+	echo "Description:"
+	echo "    ${APP_NAME} allows you to fuzz any HTTP header with a wordlist and evaluate"
+	echo "    success or failure based on the returning HTTP status code."
+	echo
+	echo "Required arguments::"
+	echo "    -w     Path to wordlist"
+	echo "    -u     URL to test against."
+	echo
+	echo "Optional arguments:"
+	echo "    -f     Fuzz string. Insert, prepend or apped %FUZZ% into your string."
+	echo "           Default: ${DEF_FUZZ}"
+	echo "    -H     Header name to fuzz."
+	echo "           Default: ${DEF_HEADER}"
+	echo "    -i     Comma separated string HTTP status codes to ignore."
+	echo "           Default: ${DEF_IGNORE_CODES}"
+	echo "    -p     Use proxy for all requests."
+	echo
+	echo "Misc arguments:"
+	echo "    -h     Print this help."
+	echo "    -v     Print version."
+	echo
+	echo "Example: find vhosts"
+	echo "    ${APP_NAME} -H Host -f '%FUZZ%.tld'            -w /path/to/domains.txt -u 'http://10.0.0.1'"
+	echo "    ${APP_NAME} -H Host -f '%FUZZ%.domain.tld'     -w /path/to/domains.txt -u 'http://10.0.0.1'"
+	echo "    ${APP_NAME} -H Host -f 'pre-%FUZZ%.domain.tld' -w /path/to/domains.txt -u 'http://10.0.0.1'"
+	echo "    ${APP_NAME} -H Host -f '%FUZZ%-suf.domain.tld' -w /path/to/domains.txt -u 'http://10.0.0.1'"
+	echo
+	echo "Example: find hidden robots.txt or sitemap.xml"
+	echo "    ${APP_NAME} -H User-Agent -w /path/to/useragents.txt -u 'http://10.0.0.1/robots.txt'"
+	echo "    ${APP_NAME} -H User-Agent -w /path/to/useragents.txt -u 'http://10.0.0.1/sitemap.xml'"
+	echo
+	echo "Example: bypass IP blacklisting"
+	echo "    ${APP_NAME} -H X-Forwarded-For -w /path/to/ip-addresses.txt -u 'http://10.0.0.1'"
+	echo
+	echo "Example: send requests through Burp"
+	echo "    ${APP_NAME} -p http://localhost:8080 -w /path/to/wordlist.txt -u 'http://10.0.0.1'"
+}
+
+print_banner() {
+	local header="${1}"
+	local codes="${2}"
+	local str_pre="${3}"
+	local str_suf="${4}"
+	local url="${5}"
+	local proxy="${6}"
+	local wordlist="${7}"
+	local total_words="${8}"
+	echo "#------------------------------------------------------------"
+	echo "# Url:      ${url}"
+	if [ -n "${proxy}" ]; then
+		echo "# Proxy:    ${proxy}"
+	fi
+	echo "# Header:   ${header}: ${str_pre}%FUZZ%${str_suf}"
+	echo "# Ignoring: ${codes}"
+	echo "# Wordlist: ${wordlist}"
+	echo "# Words:    ${total_words}"
+	echo "# Start:    $(date)"
+	echo "#------------------------------------------------------------"
+}
+
+
+# --------------------------------------------------------------------------------------------------
+# VALIDATE FUNCTIONS
+# --------------------------------------------------------------------------------------------------
+validate_code() {
+	local codes="${1//[[:space:]]/}"
+	for code in ${codes//,/ }; do
+		if ! [[ $code =~ ^[0-9]{3}$ ]]; then
+			>&2 echo "Error, http status code not a valid format: ${code}"
+			return 1
+		fi
+	done
+}
+
+validate_fuzz() {
+	local fuzz="${1}"
+	if [ "$(echo "${fuzz}" | grep -c '%FUZZ%')" != "1" ]; then
+		>&2 echo "Error, not exactly one '%FUZZ%' found in Fuzz string: ${fuzz}"
+		return 1
+	fi
+}
+
+validate_proxy() {
+	local proxy="${1}"
+	if ! [[ $proxy =~ ^http(s)?://.+(:[0-9]+)? ]]; then
+		>&2 echo "Error, incorrect proxy format: ${proxy}"
+		return 1
+	fi
+}
+
+validate_wordlist() {
+	local wordlist="${1}"
+	if [ ! -f "${wordlist}" ]; then
+		>&2 echo "Error, wordlist path not found: ${wordlist}"
+		return 1
+	fi
+}
+
+
+# --------------------------------------------------------------------------------------------------
+# TIME FUNCTIONS
+# --------------------------------------------------------------------------------------------------
+
+format_seconds() {
+	local seconds="${1}"
+
+	# Get hours
+	if [ "${seconds}" -gt "3600" ]; then
+		hrs=$(( seconds / 3600 ))
+		seconds=$(( seconds - (hrs*3600) ))
+	else
+		hrs="0"
+	fi
+	# Get minutes and seconds
+	min=$(( seconds / 60 ))
+	sec=$(( seconds % 60 ))
+	if [ "${min}" -lt "10" ]; then
+		min="0${min}"
+	fi
+	if [ "${sec}" -lt "10" ]; then
+		sec="0${sec}"
+	fi
+	echo "${hrs}:${min}:${sec}"
+}
+
+get_seconds_elapsed() {
+	local start_time="${1}"
+	local curr_time="${2}"
+	echo "$(( curr_time - start_time ))"
+}
+
+get_seconds_total() {
+	local sec_elapsed="${1}"
+	local num_curr="${2}"
+	local num_total="${3}"
+	echo "$(( num_total * sec_elapsed / num_curr ))"
+}
+
+get_seconds_remain() {
+	local sec_elapsed="${1}"
+	local sec_total="${2}"
+	echo "$(( sec_total - sec_elapsed ))"
+}
+
+
+# --------------------------------------------------------------------------------------------------
+# PARSE ARGUMENTS
+# --------------------------------------------------------------------------------------------------
+HEADER=
+IGNORE_CODES=
+FUZZ=
+PROXY=
+WORDLIST=
+URL=
+while [ "${#}" -gt "0" ]; do
+	case "${1}" in
+		# ---------- Header ----------
+		-H)
+			shift
+			if [ "${#}" -eq "0" ]; then
+				>&2 echo "Error, -H requires an arument. Type -h for help."
+				exit 1
+			fi
+			HEADER="${1}"
+			;;
+		# ---------- Code ----------
+		-i)
+			shift
+			if [ "${#}" -eq "0" ]; then
+				>&2 echo "Error, -i requires an arument. Type -h for help."
+				exit 1
+			fi
+			if ! validate_code "${1}"; then
+				exit 1
+			fi
+			IGNORE_CODES="${1//[[:space:]]/}"
+			;;
+		# ---------- Fuzz ----------
+		-f)
+			shift
+			if [ "${#}" -eq "0" ]; then
+				>&2 echo "Error, -f requires an arument. Type -h for help."
+				exit 1
+			fi
+			if ! validate_fuzz "${1}"; then
+				exit 1
+			fi
+			FUZZ="${1}"
+			;;
+		# ---------- Proxy ----------
+		-p)
+			shift
+			if [ "${#}" -eq "0" ]; then
+				>&2 echo "Error, -p requires an arument. Type -h for help."
+				exit 1
+			fi
+			if ! validate_proxy "${1}"; then
+				exit 1
+			fi
+			PROXY="${1}"
+			;;
+		# ---------- Wordlist ----------
+		-w)
+			shift
+			if [ "${#}" -eq "0" ]; then
+				>&2 echo "Error, -w requires an arument. Type -h for help."
+				exit 1
+			fi
+			if ! validate_wordlist "${1}"; then
+				exit 1
+			fi
+			WORDLIST="${1}"
+			;;
+		# ---------- Url ----------
+		-u)
+			shift
+			if [ "${#}" -eq "0" ]; then
+				>&2 echo "Error, -u requires an arument. Type -h for help."
+				exit 1
+			fi
+			URL="${1}"
+			;;
+		# ---------- Version ----------
+		-v)
+			print_version
+			exit 0
+			;;
+		# ---------- Help ----------
+		-h)
+			print_help
+			exit 0
+			;;
+		# ---------- Invalid ----------
+		*)	>&2 echo "Error, invalid argument :${1}. Type -h for help."
+			exit 1
+			;;
+	esac
+	shift
+done
+
+###
+### Check required arguments
+###
+if [ -z "${WORDLIST}" ]; then
+	>&2 echo "Error, -w is required. Type -h for help."
+	exit 1
+fi
+if [ -z "${URL}" ]; then
+	>&2 echo "Error, -u is required. Type -h for help."
+	exit 1
+fi
+
+###
+### Default optional arguments
+###
+if [ -z "${FUZZ}" ]; then
+	FUZZ="${DEF_FUZZ}"
+fi
+if [ -z "${HEADER}" ]; then
+	HEADER="${DEF_HEADER}"
+fi
+if [ -z "${IGNORE_CODES}" ]; then
+	IGNORE_CODES="${DEF_IGNORE_CODES}"
+fi
+if [ -n "${PROXY}" ]; then
+	CURL_PROXY="--proxy '${PROXY}'"
+else
+	CURL_PROXY=""
+fi
+
+###
+### Check required system tools
+###
+if ! command -v curl >/dev/null 2>&1; then
+	>&2 echo "curl not found, but required."
+	exit 1
+fi
+
+
+# --------------------------------------------------------------------------------------------------
+# MAIN ENTRYPOINT
+# --------------------------------------------------------------------------------------------------
+
+###
+### Extract domain host value for prefix and suffix
+###
+FUZZ_PRE="${FUZZ%%%FUZZ%*}"
+FUZZ_SUF="${FUZZ#*%FUZZ%}"
+
+###
+### Wordlist information
+###
+COUNT=1
+TOTAL="$( wc -l "${WORDLIST}" | awk '{print $1}' )"
+
+###
+### Print Banner
+###
+print_banner "${HEADER}" "${IGNORE_CODES}" "${FUZZ_PRE}" "${FUZZ_SUF}" "${URL}" "${PROXY}" "${WORDLIST}" "${TOTAL}"
+
+###
+### Get timings
+###
+START_TIME="$( date '+%s' )"
+TIME_TOTAL="hh:mm:ss"
+TIME_REMAIN="0:00:00"
+
+###
+### Iterate over wordlist
+###
+while read -r word; do
+	# Get time calculations
+	CURR_TIME="$( date '+%s' )"
+	if [ $(( COUNT % 10 )) -eq 0 ]; then
+		SEC_ELAPSED="$( get_seconds_elapsed "${START_TIME}" "${CURR_TIME}" )"
+		SEC_TOTAL="$( get_seconds_total "${SEC_ELAPSED}" "${COUNT}" "${TOTAL}" )"
+		SEC_REMAIN="$( get_seconds_remain "${SEC_ELAPSED}" "${SEC_TOTAL}" )"
+		TIME_TOTAL="$( format_seconds "${SEC_TOTAL}" )"
+		TIME_REMAIN="$( format_seconds "${SEC_REMAIN}" )"
+	fi
+
+	# Print info line
+	printf "\\r%s/%s (duration: %s) (remaining: %s)    \\r" "${COUNT}" "${TOTAL}" "${TIME_TOTAL}" "${TIME_REMAIN}"
+
+	# Request current page
+	CMD="curl -sS -k -I -o /dev/null -w \"%{http_code}\" \
+		${CURL_PROXY} \
+		-H \"${HEADER}:${FUZZ_PRE}${word}${FUZZ_SUF}\" \
+		\"${URL}\""
+	CODE="$( eval "${CMD}" )"
+
+	# Evaluate http status code
+	if echo "${IGNORE_CODES}" | grep -v "${CODE}" >/dev/null; then
+		# Print success
+		printf "\\r[http: %s] curl -H '%s: %s%s%s' '%s'\\n" "${CODE}" "${HEADER}" "${FUZZ_PRE}" "${word}" "${FUZZ_SUF}" "${URL}"
+	fi
+
+	# Increment counter
+	COUNT=$(( COUNT + 1 ))
+done <"${WORDLIST}"
+printf "\\n"
